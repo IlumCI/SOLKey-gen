@@ -7,6 +7,7 @@ import secrets
 import signal
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -131,6 +132,58 @@ def to_solana_keypair_bytes(private_raw: bytes, public_raw: bytes) -> bytes:
     return private_raw + public_raw
 
 
+def load_solana_keypair_file(path: Path) -> bytes:
+    values = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(values, list) or len(values) != 64:
+        raise ValueError("Expected 64-byte Solana keypair JSON array")
+    if not all(isinstance(item, int) and 0 <= item <= 255 for item in values):
+        raise ValueError("Keypair JSON must contain byte values 0..255")
+    return bytes(values)
+
+
+def run_gpu_grind(targets: tuple[str, ...], output_dir: Path, save_keypair: bool, keypair_path: Path) -> dict:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    temp_outfile = output_dir / f"gpu_hit_{uuid.uuid4().hex}.json"
+    command = ["solana-keygen", "grind", "--ignore-case", "--use-gpu", "--outfile", str(temp_outfile)]
+    for target in targets:
+        command.extend(["--ends-with", f"{target}:1"])
+
+    started = time.perf_counter()
+    proc = subprocess.run(command, capture_output=True, text=True, check=False)
+    elapsed = max(time.perf_counter() - started, 1e-9)
+
+    if proc.returncode != 0:
+        message = (proc.stderr or proc.stdout or f"exit code {proc.returncode}").strip()
+        raise RuntimeError(f"GPU grind failed: {message}")
+    if not temp_outfile.exists():
+        raise RuntimeError("GPU grind completed but no keypair outfile was produced")
+
+    keypair_bytes = load_solana_keypair_file(temp_outfile)
+    private_raw = keypair_bytes[:32]
+    public_raw = keypair_bytes[32:]
+    address = b58encode(public_raw)
+    matched = next((target for target in targets if address.endswith(target)), "unknown")
+
+    hit_payload = {
+        "target": matched,
+        "address": address,
+        "private_key_hex": private_raw.hex(),
+        "public_key_hex": public_raw.hex(),
+        "secret_key_base58": b58encode(keypair_bytes),
+        "solana_keypair": list(keypair_bytes),
+        "worker_id": "gpu",
+        "total_attempts": 0,
+        "elapsed_seconds": elapsed,
+        "created_at_unix": time.time(),
+        "engine": "solana-keygen --use-gpu",
+    }
+
+    if save_keypair:
+        write_secure_text(keypair_path, json.dumps(hit_payload["solana_keypair"]))
+    temp_outfile.unlink(missing_ok=True)
+    return hit_payload
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Multi-process Solana vanity suffix grinder")
     parser.add_argument(
@@ -187,6 +240,11 @@ def parse_args() -> argparse.Namespace:
         "--benchmark-gpu",
         action="store_true",
         help="Try GPU benchmark via solana-keygen grind --use-gpu",
+    )
+    parser.add_argument(
+        "--gpu",
+        action="store_true",
+        help="Use solana-keygen GPU grinder for actual vanity generation",
     )
     return parser.parse_args()
 
@@ -300,6 +358,35 @@ def main() -> None:
     print(f"Targets: {', '.join(targets)}")
     print(f"Processes: {args.processes}")
     print(f"Output dir: {output_dir}")
+
+    if args.gpu:
+        try:
+            hit_payload = run_gpu_grind(targets, output_dir, args.save_keypair, keypair_path)
+        except FileNotFoundError:
+            raise SystemExit("solana-keygen not found in PATH (required for --gpu)")
+        except Exception as exc:
+            raise SystemExit(str(exc))
+
+        checkpoint = {
+            "targets": list(targets),
+            "processes": "gpu",
+            "total_attempts": hit_payload["total_attempts"],
+            "elapsed_seconds": hit_payload["elapsed_seconds"],
+            "keys_per_second": None,
+            "per_worker_attempts": {"gpu": hit_payload["total_attempts"]},
+            "updated_at_unix": time.time(),
+            "status": "hit",
+            "engine": hit_payload["engine"],
+        }
+        atomic_write_json(hit_path, hit_payload)
+        atomic_write_json(checkpoint_path, checkpoint)
+        print(f"\nHIT: {hit_payload['address']} (target: {hit_payload['target']})")
+        print(f"Hit saved: {hit_path}")
+        print(f"Checkpoint: {checkpoint_path}")
+        if args.save_keypair:
+            print(f"Keypair file: {keypair_path}")
+            print(f"Use it: solana config set --keypair {keypair_path}")
+        return
 
     stop_event = mp.Event()
     queue: mp.Queue = mp.Queue()
